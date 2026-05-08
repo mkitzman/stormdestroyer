@@ -62,6 +62,9 @@ let widgetReady = false;
 let pendingAutoPlay = lsRead(LS_MUSIC_PLAYING) === '1';
 let muteByMaster = false; // true when widget.pause() is triggered by sound-off (not user)
 let drops = [];
+let litPixels = [];
+let particles = [];
+const WORDMARK_HOVER_RADIUS = 140;
 let raf, bootTimer, tickTimer, off;
 
 function resize() {
@@ -77,6 +80,7 @@ function resize() {
     c.getContext('2d').setTransform(dpr, 0, 0, dpr, 0, 0);
   }
   seedDrops();
+  buildLitPixels();
 }
 function seedDrops() {
   const cols = Math.max(20, Math.floor(w.value / 14));
@@ -90,6 +94,37 @@ function seedDrops() {
       alpha: 0.3 + Math.random() * 0.6,
     });
   }
+}
+
+// Render the wordmark to an offscreen canvas at current size and sample lit pixels
+// at a coarse grid. Used as spawn points for shedding particles on hover.
+async function buildLitPixels() {
+  if (reducedMotion()) { litPixels = []; return; }
+  const W = w.value, H = h0.value;
+  if (!W || !H) { litPixels = []; return; }
+  const fontSpec = `bold ${wordmarkSize.value}px "JetBrains Mono", ui-monospace, monospace`;
+  if (document.fonts && !document.fonts.check(fontSpec)) {
+    try { await document.fonts.ready; } catch {}
+  }
+  const off = document.createElement('canvas');
+  off.width = W; off.height = H;
+  const c = off.getContext('2d');
+  c.font = fontSpec;
+  try { c.letterSpacing = `${wordmarkSize.value * 0.04}px`; } catch {}
+  c.fillStyle = '#fff';
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  c.fillText('STORMDESTROYER', W / 2, H / 2);
+  const data = c.getImageData(0, 0, W, H).data;
+  const pixels = [];
+  const grid = 5;
+  for (let y = 0; y < H; y += grid) {
+    for (let x = 0; x < W; x += grid) {
+      const i = (y * W + x) * 4;
+      if (data[i + 3] > 180) pixels.push({ x, y });
+    }
+  }
+  litPixels = pixels;
 }
 function onMove(e)  { px.value = e.clientX; py.value = e.clientY; inside.value = true; }
 function onLeave()  { inside.value = false; }
@@ -176,7 +211,20 @@ async function initWidget() {
     if (!muteByMaster) lsWrite(LS_MUSIC_PLAYING, '0');
     muteByMaster = false;
   });
-  widget.bind(E.FINISH, () => { playing.value = false; }); // preserve intent: don't write
+  widget.bind(E.FINISH, () => {
+    // SC widget auto-advances mid-playlist on its own. We only intervene at
+    // the end to loop back to the first track.
+    if (!widget) return;
+    widget.getCurrentSoundIndex((curIdx) => {
+      widget.getSounds((sounds) => {
+        if (!sounds || sounds.length === 0) return;
+        if (curIdx >= sounds.length - 1) {
+          widget.skip(0);
+          setTimeout(() => { try { widget.play(); } catch {} }, 150);
+        }
+      });
+    });
+  });
 }
 
 function updateTrackInfo() {
@@ -251,6 +299,48 @@ function startRender() {
       ctx.fillText(d.ch, d.x, d.y);
       if (Math.random() < 0.005) d.ch = GLYPHS[Math.floor(Math.random() * GLYPHS.length)];
     }
+
+    // Wordmark shedding: spawn particles from lit letter pixels near cursor
+    if (inside.value && litPixels.length > 0) {
+      const r2 = WORDMARK_HOVER_RADIUS * WORDMARK_HOVER_RADIUS;
+      let spawned = 0;
+      for (let attempt = 0; attempt < 12 && spawned < 3; attempt++) {
+        const cand = litPixels[Math.floor(Math.random() * litPixels.length)];
+        const ddx = cand.x - px.value;
+        const ddy = cand.y - py.value;
+        if (ddx * ddx + ddy * ddy < r2) {
+          particles.push({
+            x: cand.x + (Math.random() - 0.5) * 3,
+            y: cand.y + (Math.random() - 0.5) * 3,
+            vx: (Math.random() - 0.5) * 35,
+            vy: 20 + Math.random() * 60,
+            age: 0,
+            life: 1.4 + Math.random() * 0.8,
+          });
+          spawned++;
+        }
+      }
+    }
+
+    // Update + render falling particles
+    const grav = 520;
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.vy += grav * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.age += dt;
+      if (p.age >= p.life || p.y > h0.value + 20) {
+        particles.splice(i, 1);
+        continue;
+      }
+      const a = Math.max(0, 1 - p.age / p.life);
+      ctx.fillStyle = `rgba(201, 255, 58, ${a * 0.22})`;
+      ctx.fillRect(p.x - 1.5, p.y - 1.5, 7, 7);
+      ctx.fillStyle = `rgba(201, 255, 58, ${a * 0.95})`;
+      ctx.fillRect(p.x, p.y, 4, 4);
+    }
+
     raf = requestAnimationFrame(step);
   };
   raf = requestAnimationFrame(step);
