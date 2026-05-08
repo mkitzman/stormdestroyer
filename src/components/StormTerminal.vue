@@ -1,5 +1,18 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount, nextTick, watch } from 'vue';
+
+const PLAYLIST_URL = 'https://soundcloud.com/user-691786494/sets/stormdestroyer';
+const SC_WIDGET_SRC = `https://w.soundcloud.com/player/?url=${encodeURIComponent(PLAYLIST_URL)}&visual=false&hide_related=true&show_comments=false&show_user=false&show_reposts=false&show_teaser=false&buying=false&sharing=false&liking=false&download=false&show_artwork=false&auto_play=false`;
+
+const LS_SOUND_ON = 'sd:sound:on';
+const LS_MUSIC_PLAYING = 'sd:music:wasPlaying';
+const lsRead = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsWrite = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+
+const reducedMotion = () =>
+  typeof window !== 'undefined' && window.matchMedia
+    ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    : false;
 
 const GLYPHS = '01░▒▓│┃┊┋╱╲┄┈⏤■▪◾◆◇✦✧※†‡¦¬'.split('');
 const BOOT_LINES = [
@@ -29,6 +42,25 @@ const bootIdx = ref(0);
 const audioOn = ref(false);
 const tickSec = ref(0);
 
+const playing = ref(false);
+const trackTitle = ref('');
+const trackArtist = ref('');
+const trackText = computed(() => {
+  const t = trackTitle.value;
+  const a = trackArtist.value;
+  if (t && a) return `${t} · ${a}`;
+  return t || a || 'loading…';
+});
+const titleEl = ref(null);
+const iframeRef = ref(null);
+const shouldScroll = ref(false);
+const marqueeDistance = ref('100%');
+const marqueeDuration = ref('14s');
+
+let widget = null;
+let widgetReady = false;
+let pendingAutoPlay = lsRead(LS_MUSIC_PLAYING) === '1';
+let muteByMaster = false; // true when widget.pause() is triggered by sound-off (not user)
 let drops = [];
 let raf, bootTimer, tickTimer, off;
 
@@ -94,8 +126,10 @@ function summonBolt(x) {
   }
   const id = Math.random();
   bolts.value = [...bolts.value.slice(-5), { id, points, t: Date.now() }];
-  flash.value = 1;
-  setTimeout(() => { flash.value = 0; }, 80);
+  if (!reducedMotion()) {
+    flash.value = 1;
+    setTimeout(() => { flash.value = 0; }, 80);
+  }
   setTimeout(() => { bolts.value = bolts.value.filter(b => b.id !== id); }, 600);
   if (window.SDAudio?.isEnabled()) {
     window.SDAudio.thunder(0, 0.95);
@@ -105,12 +139,88 @@ function toggleSound() {
   if (!window.SDAudio) return;
   window.SDAudio.setEnabled(!window.SDAudio.isEnabled());
 }
+
+function ensureSCApi() {
+  return new Promise((resolve) => {
+    if (window.SC && window.SC.Widget) return resolve();
+    const t0 = Date.now();
+    const check = () => {
+      if (window.SC && window.SC.Widget) return resolve();
+      if (Date.now() - t0 > 5000) return resolve(); // give up after 5s
+      setTimeout(check, 60);
+    };
+    check();
+  });
+}
+
+async function initWidget() {
+  await ensureSCApi();
+  if (!window.SC?.Widget || !iframeRef.value) return;
+  widget = window.SC.Widget(iframeRef.value);
+  const E = window.SC.Widget.Events;
+  widget.bind(E.READY, () => {
+    widgetReady = true;
+    updateTrackInfo();
+    if (pendingAutoPlay && audioOn.value) {
+      try { widget.play(); } catch {}
+    }
+    pendingAutoPlay = false;
+  });
+  widget.bind(E.PLAY, () => {
+    playing.value = true;
+    lsWrite(LS_MUSIC_PLAYING, '1');
+    updateTrackInfo();
+  });
+  widget.bind(E.PAUSE, () => {
+    playing.value = false;
+    if (!muteByMaster) lsWrite(LS_MUSIC_PLAYING, '0');
+    muteByMaster = false;
+  });
+  widget.bind(E.FINISH, () => { playing.value = false; }); // preserve intent: don't write
+}
+
+function updateTrackInfo() {
+  if (!widget) return;
+  widget.getCurrentSound((sound) => {
+    if (!sound) return;
+    trackTitle.value = sound.title || '';
+    trackArtist.value = sound.user?.username || sound.publisher_metadata?.artist || '';
+    nextTick(() => measureTitle());
+  });
+}
+
+function measureTitle() {
+  const span = titleEl.value;
+  if (!span) return;
+  const textW = span.scrollWidth;
+  if (!textW) return;
+  const gap = 32;
+  const totalDist = textW + gap;
+  const speed = 28; // px per second
+  shouldScroll.value = true; // always scroll, even when text fits
+  marqueeDistance.value = `${totalDist}px`;
+  marqueeDuration.value = `${Math.max(7, totalDist / speed)}s`;
+}
+
+function togglePlay() {
+  if (!widget || !widgetReady) return;
+  widget.toggle();
+}
+function nextTrack() {
+  if (!widget || !widgetReady) return;
+  widget.next();
+}
+function prevTrack() {
+  if (!widget || !widgetReady) return;
+  widget.prev();
+}
 function boltPath(points) {
   return points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p[0]},${p[1]}`).join(' ');
 }
 function startRender() {
   const c = canvasRef.value;
   if (!c) return;
+  if (reducedMotion()) return; // skip the rain RAF loop entirely
   const ctx = c.getContext('2d');
   let last = performance.now();
   const step = (now) => {
@@ -161,7 +271,20 @@ onMounted(() => {
   window.addEventListener('keydown', onKey);
   window.addEventListener('touchstart', onTouch, { passive: false });
   window.addEventListener('touchmove',  onTouch, { passive: false });
-  if (window.SDAudio) off = window.SDAudio.onChange(v => { audioOn.value = v; });
+  if (window.SDAudio) {
+    off = window.SDAudio.onChange(v => { audioOn.value = v; });
+    if (lsRead(LS_SOUND_ON) === '1') window.SDAudio.setEnabled(true);
+  }
+  nextTick(() => initWidget());
+});
+
+watch(audioOn, (on) => {
+  lsWrite(LS_SOUND_ON, on ? '1' : '0');
+  if (!on && playing.value && widget) {
+    muteByMaster = true;
+    try { widget.pause(); } catch {}
+  }
+  if (on) nextTick(() => measureTitle());
 });
 onBeforeUnmount(() => {
   cancelAnimationFrame(raf);
@@ -225,7 +348,7 @@ const tickStr  = computed(() => String(tickSec.value).padStart(4, '0'));
     <div class="layer scanlines"></div>
     <div class="layer vignette"></div>
 
-    <svg v-if="inside" class="layer" :viewBox="`0 0 ${w} ${h0}`" :width="w" :height="h0">
+    <svg v-if="inside" class="layer cursor-layer" :viewBox="`0 0 ${w} ${h0}`" :width="w" :height="h0">
       <circle :cx="px" :cy="py" r="160" fill="rgba(201,255,58,0.04)" />
       <circle :cx="px" :cy="py" r="80"  fill="none" stroke="rgba(201,255,58,0.4)" stroke-width="0.5" stroke-dasharray="3 3" />
       <circle :cx="px" :cy="py" r="3"   fill="#c9ff3a" />
@@ -256,14 +379,39 @@ const tickStr  = computed(() => String(tickSec.value).padStart(4, '0'));
 
     <div class="key-echo">{{ keyEcho.map(k => k.ch).join(' ') }}</div>
 
-    <button class="sound-toggle" :class="{ on: audioOn }" @click="toggleSound" :aria-pressed="audioOn">
-      <span class="dot"></span>
-      <span>{{ audioOn ? 'SOUND  ON' : 'SOUND  OFF' }}</span>
-    </button>
+    <div class="sound-toggle" :class="{ on: audioOn, expanded: audioOn }">
+      <button class="sound-btn" @click="toggleSound" :aria-pressed="audioOn">
+        <span class="dot"></span>
+        <span>{{ audioOn ? 'SOUND  ON' : 'SOUND  OFF' }}</span>
+      </button>
+
+      <div class="player" v-if="audioOn">
+        <span class="divider" aria-hidden="true"></span>
+        <button class="ctrl" @click="prevTrack" aria-label="Previous track" title="Previous">⏮</button>
+        <button class="ctrl ctrl-play" @click="togglePlay" :aria-label="playing ? 'Pause' : 'Play'" :title="playing ? 'Pause' : 'Play'">
+          <span v-if="playing">⏸</span>
+          <span v-else>▶</span>
+        </button>
+        <button class="ctrl" @click="nextTrack" aria-label="Next track" title="Next">⏭</button>
+        <span class="divider" aria-hidden="true"></span>
+        <div class="eq" :class="{ playing }" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </div>
+        <div class="track-title">
+          <div class="track-title-inner" :class="{ scrolling: shouldScroll }"
+               :style="{ '--marquee-distance': marqueeDistance, '--marquee-duration': marqueeDuration }">
+            <span ref="titleEl">{{ trackText }}</span>
+            <span aria-hidden="true">{{ trackText }}</span>
+          </div>
+        </div>
+      </div>
+
+      <iframe ref="iframeRef" class="sc-iframe" allow="autoplay" :src="SC_WIDGET_SRC"
+              aria-hidden="true" tabindex="-1" title="SoundCloud player"></iframe>
+    </div>
 
     <div class="footer">
-      <div>STORMDESTROYER · MMXXVI</div>
-      <div>soon.</div>
+      <div>STORMDESTROYER · MMXXVI · SOON.</div>
     </div>
   </div>
 </template>
