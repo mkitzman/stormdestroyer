@@ -98,9 +98,7 @@ function summonBolt(x) {
   setTimeout(() => { flash.value = 0; }, 80);
   setTimeout(() => { bolts.value = bolts.value.filter(b => b.id !== id); }, 600);
   if (window.SDAudio?.isEnabled()) {
-    window.SDAudio.thunder(0, 0.9);
-    window.SDAudio.kick(0.02, 0.7);
-    window.SDAudio.stab(0.05, 220, 0.6);
+    window.SDAudio.thunder(0, 0.95);
   }
 }
 function toggleSound() {
