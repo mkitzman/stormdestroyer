@@ -460,13 +460,6 @@ const tickStr  = computed(() => String(tickSec.value).padStart(4, '0'));
       <div>type. lightning.</div>
     </div>
 
-    <div class="caption">
-      <div class="caption-inner">
-        <span class="arrow">►</span>
-        type any key to summon
-      </div>
-    </div>
-
     <div class="key-echo">{{ keyEcho.map(k => k.ch).join(' ') }}</div>
 
     <div class="sound-toggle" :class="{ on: audioOn, expanded: audioOn }">
